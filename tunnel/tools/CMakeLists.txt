@@ -9,7 +9,7 @@ add_link_options(LINKER:--build-id=none)
 add_compile_options(-Wall -Werror)
 
 # 设置预编译库目录
-set(PREBUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt)
+set(PREBUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../prebuilt)
 set(PREBUILT_LIBS_DIR ${PREBUILT_DIR}/libs)
 set(PREBUILT_INCLUDE_DIR ${PREBUILT_DIR}/include)
 
