@@ -1,7 +1,7 @@
 #include <jni.h>
 #include <string>
 
-#include "u2t_tlcp_android.h"
+#include "u2t_tlcp/u2t_tlcp_android.h"
 
 
 extern "C" {
