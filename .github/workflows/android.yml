@@ -46,12 +46,23 @@ jobs:
         echo "Checking APK release directory..."
         ls -la wireguard-android/ui/build/outputs/apk/ || echo "APK directory not found"
 
+    - name: Sign
+      run: |
+        mkdir -p /opt/wg
+        mv ./ui/build/outputs/apk/release/ui-release-unsigned.apk /opt/wg/app-release-unsigned.apk
+        cd /opt/wg
+        # 生成签名文件keystore.jks
+        keytool -genkey -v -keystore keystore.jks -storepass $password -alias key -keypass $password -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android, OU=Android, O=Android, L=BeiJing, ST=BeiJing, C=CN"
+        # 启用谷歌v1 v2 v3 v4 签名方式同时签名
+        /usr/local/lib/android/sdk/build-tools/36.0.0/apksigner sign --ks keystore.jks --ks-key-alias key --ks-pass pass:$password --key-pass pass:$password --out wireguard-android.apk --in app-release-unsigned.apk --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled true
+        rm app-release-unsigned.apk
+
     - name: Upload APK as artifact
       uses: actions/upload-artifact@v4
       with:
         name: release-apk
         path: |
-          ui/build/outputs/apk/release/ui-release-unsigned.apk
+          /opt/wg/*
           # wireguard-android/ui/build/outputs/apk/release/*.apk
           # wireguard-android/ui/build/outputs/bundle/release/*.aab  # 如果有App Bundle
         if-no-files-found: error  # 如果没找到文件则报错
