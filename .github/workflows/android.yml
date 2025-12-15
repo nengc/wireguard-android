@@ -52,9 +52,31 @@ jobs:
         mv ./ui/build/outputs/apk/release/ui-release-unsigned.apk /opt/wg/app-release-unsigned.apk
         cd /opt/wg
         # 生成签名文件keystore.jks
-        keytool -genkey -v -keystore keystore.jks -storepass $password -alias key -keypass $password -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android, OU=Android, O=Android, L=BeiJing, ST=BeiJing, C=CN"
+        keytool -genkeypair -v \
+          -keystore keystore.jks \
+          -alias key \
+          -keyalg RSA \
+          -keysize 2048 \
+          -validity 10000 \
+          -storepass ${{ secrets.SIGNING_PASSWORD || 'android' }} \
+          -keypass ${{ secrets.SIGNING_PASSWORD || 'android' }} \
+          -dname "CN=Android, OU=Android, O=Android, L=BeiJing, ST=BeiJing, C=CN"
+        # keytool -genkey -v -keystore keystore.jks -storepass $password -alias key -keypass $password -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android, OU=Android, O=Android, L=BeiJing, ST=BeiJing, C=CN"
+        # 找到最新的apksigner
+        APKSIGNER_PATH=$(find /usr/local/lib/android/sdk/build-tools -name "apksigner" | sort -V | tail -1)
+        echo "Using apksigner: $APKSIGNER_PATH"
         # 启用谷歌v1 v2 v3 v4 签名方式同时签名
-        /usr/local/lib/android/sdk/build-tools/36.0.0/apksigner sign --ks keystore.jks --ks-key-alias key --ks-pass pass:$password --key-pass pass:$password --out wireguard-android.apk --in app-release-unsigned.apk --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled true
+        # /usr/local/lib/android/sdk/build-tools/36.0.0/apksigner sign --ks keystore.jks --ks-key-alias key --ks-pass pass:$password --key-pass pass:$password --out wireguard-android.apk --in app-release-unsigned.apk --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled true
+        $APKSIGNER_PATH sign \
+          --ks keystore.jks \
+          --ks-key-alias key \
+          --ks-pass pass:${{ secrets.SIGNING_PASSWORD || 'android' }} \
+          --key-pass pass:${{ secrets.SIGNING_PASSWORD || 'android' }} \
+          --out wireguard-android-signed.apk \
+          --in app-release-unsigned.apk \
+          --v1-signing-enabled true \
+          --v2-signing-enabled true \
+          --v3-signing-enabled true
         rm app-release-unsigned.apk
 
     - name: Upload APK as artifact
