@@ -13,6 +13,10 @@ set(PREBUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt)
 set(PREBUILT_LIBS_DIR ${PREBUILT_DIR}/libs)
 set(PREBUILT_INCLUDE_DIR ${PREBUILT_DIR}/include)
 
+message(STATUS "PREBUILT_DIR: ${PREBUILT_DIR}")
+message(STATUS "PREBUILT_LIBS_DIR: ${PREBUILT_LIBS_DIR}")
+message(STATUS "PREBUILT_INCLUDE_DIR: ${PREBUILT_INCLUDE_DIR}")
+
 # 添加 u2t_tlcp 头文件路径
 include_directories(${PREBUILT_INCLUDE_DIR})
 
@@ -28,10 +32,8 @@ if(EXISTS ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so)
         IMPORTED_NO_SONAME TRUE
     )
     
-    # 可选：为库添加编译定义（如果需要）
-    # target_compile_definitions(u2t_tlcp_android INTERFACE U2T_TLCP_ENABLED=1)
-    
     # 创建自定义命令来复制库到输出目录
+    # 注意：这是自定义目标，不在 Gradle 的 targets 列表中
     add_custom_command(
         OUTPUT ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libu2t_tlcp_android.so
         COMMAND ${CMAKE_COMMAND} -E copy
@@ -41,7 +43,8 @@ if(EXISTS ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so)
         COMMENT "Copying libu2t_tlcp_android.so for ${ANDROID_ABI}"
     )
     
-    add_custom_target(copy_u2t_tlcp_android ALL
+    # 创建自定义目标，但不添加到 Gradle 的 targets 列表
+    add_custom_target(copy_u2t_tlcp_internal ALL
         DEPENDS ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libu2t_tlcp_android.so
     )
     
@@ -49,36 +52,56 @@ else()
     message(WARNING "Prebuilt libu2t_tlcp_android.so not found for ${ANDROID_ABI} at ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so")
 endif()
 
-
-# 添加 U2T TLCP JNI 代码
-add_library(u2t_tlcp_jni SHARED
-    u2t_tlcp_jni.cpp
-)
-
-target_include_directories(u2t_tlcp_jni PRIVATE
-    ${PREBUILT_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-target_compile_options(u2t_tlcp_jni PRIVATE
-    -std=c++11
-    -Wall
-    -Werror
-)
-
-# 链接 u2t_tlcp_android 库
-if(TARGET u2t_tlcp_android)
-    target_link_libraries(u2t_tlcp_jni u2t_tlcp_android)
+# 确保 u2t_tlcp_jni.cpp 文件存在
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/u2t_tlcp_jni.cpp)
+    message(STATUS "Found u2t_tlcp_jni.cpp, building JNI wrapper")
+    
+    # 添加 U2T TLCP JNI 代码（库目标，在 Gradle 的 targets 列表中）
+    add_library(u2t_tlcp_jni SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/u2t_tlcp_jni.cpp
+    )
+    
+    target_include_directories(u2t_tlcp_jni PRIVATE
+        ${PREBUILT_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    
+    target_compile_options(u2t_tlcp_jni PRIVATE
+        -std=c++11  # 使用 C++11 标准
+        -Wall
+        -Werror
+    )
+    
+    # 链接 u2t_tlcp_android 库（如果存在）
+    if(TARGET u2t_tlcp_android)
+        message(STATUS "Linking u2t_tlcp_jni with u2t_tlcp_android")
+        target_link_libraries(u2t_tlcp_jni u2t_tlcp_android)
+    endif()
+    
+    # 链接其他必需的库
+    target_link_libraries(u2t_tlcp_jni
+        -llog
+    )
+    
+    # 确保 JNI 库在预编译库复制之后构建
+    if(TARGET copy_u2t_tlcp_internal)
+        add_dependencies(u2t_tlcp_jni copy_u2t_tlcp_internal)
+    endif()
+    
+    # 为 u2t_tlcp_jni 也添加 elf 清理
+    if(TARGET elf-cleaner)
+        add_custom_command(TARGET u2t_tlcp_jni POST_BUILD VERBATIM COMMAND "${CMAKE_CURRENT_BINARY_DIR}/elf-cleaner"
+            --api-level "${ANDROID_NATIVE_API_LEVEL}" "$<TARGET_FILE:u2t_tlcp_jni>"
+            COMMENT "Stripping u2t_tlcp_jni.so"
+        )
+        add_dependencies(u2t_tlcp_jni elf-cleaner)
+    endif()
+    
+else()
+    message(WARNING "u2t_tlcp_jni.cpp not found at ${CMAKE_CURRENT_SOURCE_DIR}/u2t_tlcp_jni.cpp")
 endif()
 
-# 如果需要，也链接其他库
-target_link_libraries(u2t_tlcp_jni
-    -llog
-    -landroid
-)
-
-
-
+# 现有的 WireGuard 构建配置保持不变
 add_executable(libwg-quick.so wireguard-tools/src/wg-quick/android.c ndk-compat/compat.c)
 target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 target_link_libraries(libwg-quick.so -ldl)
@@ -107,9 +130,12 @@ add_custom_target(elf-cleaner COMMENT "Building elf-cleaner" VERBATIM COMMAND cc
         -O2 -DPACKAGE_NAME="elf-cleaner" -DPACKAGE_VERSION="" -DCOPYRIGHT=""
         -o "${CMAKE_CURRENT_BINARY_DIR}/elf-cleaner" ${ELF_CLEANER_SOURCES}
 )
+
+# 为 WireGuard 库添加 elf 清理
 add_custom_command(TARGET libwg.so POST_BUILD VERBATIM COMMAND "${CMAKE_CURRENT_BINARY_DIR}/elf-cleaner"
         --api-level "${ANDROID_NATIVE_API_LEVEL}" "$<TARGET_FILE:libwg.so>")
 add_dependencies(libwg.so elf-cleaner)
+
 add_custom_command(TARGET libwg-quick.so POST_BUILD VERBATIM COMMAND "${CMAKE_CURRENT_BINARY_DIR}/elf-cleaner"
         --api-level "${ANDROID_NATIVE_API_LEVEL}" "$<TARGET_FILE:libwg-quick.so>")
 add_dependencies(libwg-quick.so elf-cleaner)
