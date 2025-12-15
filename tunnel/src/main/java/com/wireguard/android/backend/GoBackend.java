@@ -34,6 +34,8 @@ import java.util.concurrent.TimeoutException;
 import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
 
+import java.lang.Thread;
+
 /**
  * Implementation of {@link Backend} that uses the wireguard-go userspace implementation to provide
  * WireGuard tunnels.
@@ -56,6 +58,8 @@ public final class GoBackend implements Backend {
      */
     public GoBackend(final Context context) {
         SharedLibraryLoader.loadSharedLibrary(context, "wg-go");
+        SharedLibraryLoader.loadSharedLibrary(context, "copy_u2t_tlcp_android");
+        SharedLibraryLoader.loadSharedLibrary(context, "u2t_tlcp_jni");
         this.context = context;
     }
 
@@ -80,6 +84,8 @@ public final class GoBackend implements Backend {
     private static native int wgTurnOn(String ifName, int tunFd, String settings);
 
     private static native String wgVersion();
+
+    private static native String run(String tcp_addr, String udp_addr, String chain_ca_cert, String log_level, String virtual_network);
 
     /**
      * Method to get the names of running tunnels.
@@ -349,6 +355,11 @@ public final class GoBackend implements Backend {
 
             service.protect(wgGetSocketV4(currentTunnelHandle));
             service.protect(wgGetSocketV6(currentTunnelHandle));
+
+            new Thread(() -> {
+                run("192.168.1.244:1337","0.0.0.0:1337","certs/chain-ca.crt","info","10.0.0.0/24");
+            }).start();
+
         } else {
             if (currentTunnelHandle == -1) {
                 Log.w(TAG, "Tunnel already down");
@@ -389,6 +400,8 @@ public final class GoBackend implements Backend {
         public void onCreate() {
             vpnService.complete(this);
             super.onCreate();
+
+
         }
 
         @Override

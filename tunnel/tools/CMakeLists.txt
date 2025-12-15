@@ -8,6 +8,77 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
 add_link_options(LINKER:--build-id=none)
 add_compile_options(-Wall -Werror)
 
+# 设置预编译库目录
+set(PREBUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../prebuilt)
+set(PREBUILT_LIBS_DIR ${PREBUILT_DIR}/libs)
+set(PREBUILT_INCLUDE_DIR ${PREBUILT_DIR}/include)
+
+# 添加 u2t_tlcp 头文件路径
+include_directories(${PREBUILT_INCLUDE_DIR})
+
+# 检查并添加预编译的 libu2t_tlcp_android.so
+if(EXISTS ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so)
+    message(STATUS "Found prebuilt libu2t_tlcp_android.so for ${ANDROID_ABI}")
+    
+    # 导入预编译库
+    add_library(u2t_tlcp_android SHARED IMPORTED)
+    
+    set_target_properties(u2t_tlcp_android PROPERTIES
+        IMPORTED_LOCATION ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so
+        IMPORTED_NO_SONAME TRUE
+    )
+    
+    # 可选：为库添加编译定义（如果需要）
+    # target_compile_definitions(u2t_tlcp_android INTERFACE U2T_TLCP_ENABLED=1)
+    
+    # 创建自定义命令来复制库到输出目录
+    add_custom_command(
+        OUTPUT ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libu2t_tlcp_android.so
+        COMMAND ${CMAKE_COMMAND} -E copy
+            ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so
+            ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libu2t_tlcp_android.so
+        DEPENDS ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so
+        COMMENT "Copying libu2t_tlcp_android.so for ${ANDROID_ABI}"
+    )
+    
+    add_custom_target(copy_u2t_tlcp_android ALL
+        DEPENDS ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libu2t_tlcp_android.so
+    )
+    
+else()
+    message(WARNING "Prebuilt libu2t_tlcp_android.so not found for ${ANDROID_ABI} at ${PREBUILT_LIBS_DIR}/${ANDROID_ABI}/libu2t_tlcp_android.so")
+endif()
+
+
+# 添加 U2T TLCP JNI 代码
+add_library(u2t_tlcp_jni SHARED
+    u2t_tlcp_jni.c
+)
+
+target_include_directories(u2t_tlcp_jni PRIVATE
+    ${PREBUILT_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_options(u2t_tlcp_jni PRIVATE
+    -std=c11
+    -Wall
+    -Werror
+)
+
+# 链接 u2t_tlcp_android 库
+if(TARGET u2t_tlcp_android)
+    target_link_libraries(u2t_tlcp_jni u2t_tlcp_android)
+endif()
+
+# 如果需要，也链接其他库
+target_link_libraries(u2t_tlcp_jni
+    -llog
+    -landroid
+)
+
+
+
 add_executable(libwg-quick.so wireguard-tools/src/wg-quick/android.c ndk-compat/compat.c)
 target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 target_link_libraries(libwg-quick.so -ldl)

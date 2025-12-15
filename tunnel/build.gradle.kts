@@ -33,9 +33,10 @@ android {
         all {
             externalNativeBuild {
                 cmake {
-                    targets("libwg-go.so", "libwg.so", "libwg-quick.so")
+                    targets("libwg-go.so", "libwg.so", "libwg-quick.so", "copy_u2t_tlcp_android", "u2t_tlcp_jni")
                     arguments("-DGRADLE_USER_HOME=${project.gradle.gradleUserHomeDir}")
                     arguments("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+                    arguments("-DPREBUILT_LIBS_PATH=${projectDir}/prebuilt/libs")
                 }
             }
         }
