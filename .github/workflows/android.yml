@@ -51,7 +51,8 @@ jobs:
       with:
         name: release-apk
         path: |
-          wireguard-android/ui/build/outputs/apk/release/*.apk
-          wireguard-android/ui/build/outputs/bundle/release/*.aab  # 如果有App Bundle
+          ui/build/outputs/apk/release/ui-release-unsigned.apk
+          # wireguard-android/ui/build/outputs/apk/release/*.apk
+          # wireguard-android/ui/build/outputs/bundle/release/*.aab  # 如果有App Bundle
         if-no-files-found: error  # 如果没找到文件则报错
         retention-days: 7  # 保留7天
