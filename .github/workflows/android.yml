@@ -33,12 +33,22 @@ jobs:
       working-directory: ./
       run: ./gradlew assembleRelease
 
+    - name: List build outputs for debugging
+      run: |
+        echo "Listing build outputs..."
+        find . -name "*.apk" -type f | head -20
+        find . -name "*.aab" -type f | head -20
+        echo "Checking wireguard-android directory..."
+        ls -la wireguard-android/ui/build/outputs/ || echo "Directory not found"
+        echo "Checking APK release directory..."
+        ls -la wireguard-android/ui/build/outputs/apk/ || echo "APK directory not found"
+
     - name: Upload APK as artifact
       uses: actions/upload-artifact@v4
       with:
         name: release-apk
         path: |
-          wireguard-android/app/build/outputs/apk/release/*.apk
-          wireguard-android/app/build/outputs/bundle/release/*.aab  # 如果有App Bundle
+          wireguard-android/ui/build/outputs/apk/release/*.apk
+          wireguard-android/ui/build/outputs/bundle/release/*.aab  # 如果有App Bundle
         if-no-files-found: error  # 如果没找到文件则报错
         retention-days: 7  # 保留7天
