@@ -35,6 +35,9 @@ jobs:
 
     - name: List build outputs for debugging
       run: |
+        ls
+        ls tunnel
+        ls ui
         echo "Listing build outputs..."
         find . -name "*.apk" -type f | head -20
         find . -name "*.aab" -type f | head -20
