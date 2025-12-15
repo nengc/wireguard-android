@@ -52,7 +52,7 @@ endif()
 
 # 添加 U2T TLCP JNI 代码
 add_library(u2t_tlcp_jni SHARED
-    u2t_tlcp_jni.c
+    u2t_tlcp_jni.cpp
 )
 
 target_include_directories(u2t_tlcp_jni PRIVATE
@@ -61,7 +61,7 @@ target_include_directories(u2t_tlcp_jni PRIVATE
 )
 
 target_compile_options(u2t_tlcp_jni PRIVATE
-    -std=c11
+    -std=c++11
     -Wall
     -Werror
 )
