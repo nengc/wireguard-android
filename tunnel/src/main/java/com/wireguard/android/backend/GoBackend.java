@@ -36,7 +36,6 @@ import java.util.concurrent.TimeoutException;
 
 import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
-import androidx.core.app.NotificationCompat;
 
 import java.lang.Thread;
 import java.io.IOException;
@@ -464,11 +463,17 @@ public final class GoBackend implements Backend {
 
         // 启动前台服务通知
         void startHttpServiceForeground() {
-            Notification notification = new NotificationCompat.Builder(this, HTTP_SERVICE_CHANNEL_ID)
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, HTTP_SERVICE_CHANNEL_ID);
+            } else {
+                builder = new Notification.Builder(this);
+            }
+            
+            Notification notification = builder
                 .setContentTitle("WireGuard HTTP Service")
                 .setContentText("HTTP service is running on port 1337")
-                .setSmallIcon(android.R.drawable.ic_dialog_info) // 替换为你的图标
-                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setOngoing(true)
                 .build();
 
