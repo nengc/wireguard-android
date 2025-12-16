@@ -12,6 +12,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.os.PowerManager;
 import android.system.OsConstants;
 import android.util.Log;
 
@@ -33,21 +34,25 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
 
 import java.lang.Thread;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
+import java.net.DatagramSocket;
+import java.net.SocketException;
 
 @NonNullForAll
 public final class GoBackend implements Backend {
     private static final int DNS_RESOLUTION_RETRIES = 10;
     private static final String TAG = "WireGuard/GoBackend";
-    private static final String HTTP_SERVICE_CHANNEL_ID = "wireguard_http_service";
-    private static final int HTTP_SERVICE_NOTIFICATION_ID = 1338;
+    private static final String UDP_SERVICE_CHANNEL_ID = "wireguard_udp_service";
+    private static final int UDP_SERVICE_NOTIFICATION_ID = 1338;
+    private static final int UDP_LISTEN_PORT = 1337;
+    private static final int PORT_CHECK_MAX_RETRIES = 20;
+    private static final long PORT_CHECK_INTERVAL_MS = 500;
     
     @Nullable private static AlwaysOnCallback alwaysOnCallback;
     private static CompletableFuture<VpnService> vpnService = new CompletableFuture<>();
@@ -56,9 +61,11 @@ public final class GoBackend implements Backend {
     @Nullable private Tunnel currentTunnel;
     private int currentTunnelHandle = -1;
     
-    // HTTP 服务相关
-    @Nullable private Thread httpServerThread;
-    private volatile boolean httpServerRunning = false;
+    // UDP 监听服务相关
+    @Nullable private Thread udpServiceThread;
+    private final AtomicBoolean udpServiceRunning = new AtomicBoolean(false);
+    private final AtomicBoolean udpServiceShouldStop = new AtomicBoolean(false);
+    private final AtomicInteger udpServiceHandle = new AtomicInteger(-1);
 
     public GoBackend(final Context context) {
         SharedLibraryLoader.loadSharedLibrary(context, "wg-go");
@@ -77,97 +84,243 @@ public final class GoBackend implements Backend {
     private static native void wgTurnOff(int handle);
     private static native int wgTurnOn(String ifName, int tunFd, String settings);
     private static native String wgVersion();
+    
+    // UDP 监听服务的 native 方法
+    // 返回值：成功时返回服务标识，失败返回错误信息
     private static native String run(String tcp_addr, String udp_addr, String chain_ca_cert, String log_level, String virtual_network);
+    
+    // 如果你的 native 代码支持停止，添加这个方法
+    // private static native void stopUdpService();
 
-    private static boolean isPortAvailable(int port) {
-        try (ServerSocket serverSocket = new ServerSocket()) {
-            serverSocket.setReuseAddress(true);
-            serverSocket.bind(new InetSocketAddress(port));
+    /**
+     * 检查 UDP 端口是否可用
+     */
+    private static boolean isUdpPortAvailable(int port) {
+        DatagramSocket socket = null;
+        try {
+            socket = new DatagramSocket(port);
+            socket.setReuseAddress(true);
             return true;
-        } catch (IOException e) {
+        } catch (SocketException e) {
+            Log.d(TAG, "Port " + port + " check failed: " + e.getMessage());
             return false;
+        } finally {
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+            }
         }
     }
 
-    // 启动 HTTP 服务（延迟启动，确保 VPN 隧道完全就绪）
-    private void startHttpServer(final VpnService service) {
-        if (httpServerRunning) {
-            Log.d(TAG, "HTTP server already running");
+    /**
+     * 强制尝试释放 UDP 端口
+     * 通过短暂绑定再关闭来触发系统释放端口
+     */
+    private void forceReleaseUdpPort(int port) {
+        DatagramSocket socket = null;
+        try {
+            Log.d(TAG, "Attempting to force release UDP port " + port);
+            socket = new DatagramSocket(null);
+            socket.setReuseAddress(true);
+            socket.bind(new java.net.InetSocketAddress(port));
+            // 立即关闭
+            socket.close();
+            socket = null;
+            
+            // 给系统一点时间完全释放端口
+            Thread.sleep(300);
+            Log.d(TAG, "UDP port " + port + " force release completed");
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to force release UDP port " + port + ": " + e.getMessage());
+        } finally {
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+            }
+        }
+    }
+
+    /**
+     * 等待 UDP 端口变为可用
+     */
+    private boolean waitForUdpPortAvailable(int port, int maxRetries) {
+        Log.i(TAG, "Waiting for UDP port " + port + " to become available...");
+        
+        for (int i = 0; i < maxRetries; i++) {
+            // 检查是否应该停止
+            if (udpServiceShouldStop.get() || currentTunnelHandle == -1) {
+                Log.i(TAG, "Port wait cancelled due to shutdown signal");
+                return false;
+            }
+            
+            if (isUdpPortAvailable(port)) {
+                Log.i(TAG, "UDP port " + port + " is available (attempt " + (i + 1) + ")");
+                return true;
+            }
+            
+            // 第一次和第五次失败时尝试强制释放
+            if (i == 0 || i == 5) {
+                forceReleaseUdpPort(port);
+            }
+            
+            Log.d(TAG, "UDP port " + port + " not available, retrying... (" + (i + 1) + "/" + maxRetries + ")");
+            
+            try {
+                Thread.sleep(PORT_CHECK_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "Port wait interrupted");
+                return false;
+            }
+        }
+        
+        Log.e(TAG, "UDP port " + port + " still not available after " + maxRetries + " attempts");
+        return false;
+    }
+
+    /**
+     * 启动 UDP 监听服务
+     */
+    private void startUdpService(final VpnService service) {
+        if (udpServiceRunning.get()) {
+            Log.w(TAG, "UDP service already running");
             return;
         }
 
-        // 先启动前台通知，防止服务被杀
-        service.startHttpServiceForeground();
+        Log.i(TAG, "Starting UDP service...");
+        udpServiceShouldStop.set(false);
+        
+        // 立即启动前台通知，防止被系统杀掉
+        service.startUdpServiceForeground();
 
-        // 延迟启动，给 VPN 隧道一些初始化时间
-        new Thread(() -> {
+        // 创建独立线程运行 UDP 监听服务
+        udpServiceThread = new Thread(() -> {
             try {
-                // 等待 2 秒，确保 VPN 隧道完全建立
+                // 等待 VPN 隧道完全建立并稳定
+                Log.d(TAG, "Waiting for VPN tunnel to stabilize before starting UDP service...");
                 Thread.sleep(2000);
                 
-                // 检查 VPN 是否还在运行
-                if (currentTunnelHandle == -1) {
-                    Log.w(TAG, "VPN tunnel closed, skipping HTTP server start");
+                // 检查 VPN 和停止信号
+                if (currentTunnelHandle == -1 || udpServiceShouldStop.get()) {
+                    Log.w(TAG, "VPN tunnel closed or stop requested, aborting UDP service start");
                     return;
                 }
 
-                // 再次检查端口（可能之前的进程没清理干净）
-                if (!isPortAvailable(1337)) {
-                    Log.w(TAG, "Port 1337 is not available, waiting...");
-                    // 等待最多 10 秒，每秒检查一次
-                    for (int i = 0; i < 10; i++) {
-                        Thread.sleep(1000);
-                        if (isPortAvailable(1337)) {
-                            Log.i(TAG, "Port 1337 became available");
-                            break;
-                        }
-                        if (currentTunnelHandle == -1) {
-                            Log.w(TAG, "VPN closed during port wait");
-                            return;
-                        }
-                    }
-                    
-                    if (!isPortAvailable(1337)) {
-                        Log.e(TAG, "Port 1337 still not available after 10 seconds, aborting");
-                        return;
-                    }
+                // 等待 UDP 端口可用
+                Log.i(TAG, "Checking UDP port " + UDP_LISTEN_PORT + " availability...");
+                if (!waitForUdpPortAvailable(UDP_LISTEN_PORT, PORT_CHECK_MAX_RETRIES)) {
+                    Log.e(TAG, "Cannot start UDP service: port " + UDP_LISTEN_PORT + " unavailable");
+                    service.updateNotification("UDP service failed: port unavailable");
+                    return;
                 }
 
-                httpServerRunning = true;
-                httpServerThread = Thread.currentThread();
+                // 最后一次检查状态
+                if (currentTunnelHandle == -1 || udpServiceShouldStop.get()) {
+                    Log.w(TAG, "VPN closed or stop requested during port wait");
+                    return;
+                }
+
+                // 标记服务正在运行
+                udpServiceRunning.set(true);
+                service.updateNotification("UDP service running on port " + UDP_LISTEN_PORT);
                 
-                Log.i(TAG, "Starting HTTP server on port 1337");
-                // 调用 native 方法启动服务器（这可能是阻塞调用）
-                String result = run("192.168.1.244:1337", "0.0.0.0:1337", 
-                    "certs/chain-ca.crt", "info", "10.0.0.0/24");
-                Log.i(TAG, "HTTP server returned: " + result);
+                Log.i(TAG, "Starting UDP listener on port " + UDP_LISTEN_PORT);
+                
+                // 调用 native 方法启动 UDP 监听（这是阻塞调用）
+                // run() 会一直阻塞直到服务停止或出错
+                String result = run(
+                    "192.168.1.244:" + UDP_LISTEN_PORT,  // TCP 地址（如果需要）
+                    "0.0.0.0:" + UDP_LISTEN_PORT,        // UDP 监听地址
+                    "certs/chain-ca.crt",                // 证书路径
+                    "info",                              // 日志级别
+                    "10.0.0.0/24"                       // 虚拟网络
+                );
+                
+                Log.i(TAG, "UDP service exited: " + result);
                 
             } catch (InterruptedException e) {
-                Log.i(TAG, "HTTP server thread interrupted");
+                Log.i(TAG, "UDP service thread interrupted");
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
-                Log.e(TAG, "HTTP server crashed", e);
+                Log.e(TAG, "UDP service crashed with exception", e);
+                try {
+                    final VpnService svc = vpnService.get(0, TimeUnit.NANOSECONDS);
+                    svc.updateNotification("UDP service error: " + e.getMessage());
+                } catch (Exception ignored) { }
             } finally {
-                httpServerRunning = false;
-                httpServerThread = null;
-                Log.i(TAG, "HTTP server stopped");
+                udpServiceRunning.set(false);
+                Log.i(TAG, "UDP service thread finished");
+                
+                // 确保端口被完全释放
+                forceReleaseUdpPort(UDP_LISTEN_PORT);
+                
+                // 更新通知状态
+                try {
+                    final VpnService svc = vpnService.get(0, TimeUnit.NANOSECONDS);
+                    svc.updateNotification("UDP service stopped");
+                } catch (Exception ignored) { }
             }
-        }, "WireGuard-HTTP-Server").start();
+        }, "WireGuard-UDP-Listener");
+        
+        udpServiceThread.setDaemon(false);  // 不设为守护线程，确保不会被意外终止
+        udpServiceThread.setPriority(Thread.NORM_PRIORITY + 1);  // 稍微提高优先级
+        
+        // 设置未捕获异常处理器
+        udpServiceThread.setUncaughtExceptionHandler((t, e) -> {
+            Log.e(TAG, "Uncaught exception in UDP service thread", e);
+            udpServiceRunning.set(false);
+            forceReleaseUdpPort(UDP_LISTEN_PORT);
+        });
+        
+        udpServiceThread.start();
+        Log.i(TAG, "UDP service thread started");
     }
 
-    // 停止 HTTP 服务
-    private void stopHttpServer(final VpnService service) {
-        httpServerRunning = false;
-        if (httpServerThread != null && httpServerThread.isAlive()) {
-            Log.i(TAG, "Stopping HTTP server");
-            httpServerThread.interrupt();
+    /**
+     * 停止 UDP 监听服务
+     */
+    private void stopUdpService(final VpnService service) {
+        Log.i(TAG, "Stopping UDP service...");
+        
+        // 设置停止标志
+        udpServiceShouldStop.set(true);
+        udpServiceRunning.set(false);
+        
+        // 如果你的 native 代码支持停止信号，在这里调用
+        // stopUdpService();
+        
+        Thread threadToStop = udpServiceThread;
+        if (threadToStop != null && threadToStop.isAlive()) {
+            Log.d(TAG, "Interrupting UDP service thread...");
+            threadToStop.interrupt();
+            
             try {
-                httpServerThread.join(5000); // 等待最多 5 秒
+                // 等待线程优雅退出
+                threadToStop.join(5000);
+                
+                if (threadToStop.isAlive()) {
+                    Log.w(TAG, "UDP service thread still alive after 5s");
+                    // 再次尝试中断
+                    threadToStop.interrupt();
+                    threadToStop.join(2000);
+                    
+                    if (threadToStop.isAlive()) {
+                        Log.e(TAG, "UDP service thread forcefully abandoned");
+                    }
+                }
             } catch (InterruptedException e) {
-                Log.w(TAG, "Interrupted while waiting for HTTP server to stop");
+                Log.w(TAG, "Interrupted while waiting for UDP service to stop");
+                Thread.currentThread().interrupt();
             }
-            httpServerThread = null;
         }
-        service.stopHttpServiceForeground();
+        
+        udpServiceThread = null;
+        
+        // 强制释放 UDP 端口
+        forceReleaseUdpPort(UDP_LISTEN_PORT);
+        
+        // 停止前台服务通知
+        service.stopUdpServiceForeground();
+        
+        Log.i(TAG, "UDP service stopped completely");
     }
 
     @Override
@@ -393,8 +546,8 @@ public final class GoBackend implements Backend {
             service.protect(wgGetSocketV4(currentTunnelHandle));
             service.protect(wgGetSocketV6(currentTunnelHandle));
 
-            // 启动 HTTP 服务
-            startHttpServer(service);
+            // 启动 UDP 监听服务
+            startUdpService(service);
 
         } else {
             if (currentTunnelHandle == -1) {
@@ -402,10 +555,10 @@ public final class GoBackend implements Backend {
                 return;
             }
             
-            // 先停止 HTTP 服务
+            // 先停止 UDP 监听服务
             try {
                 final VpnService service = vpnService.get(0, TimeUnit.NANOSECONDS);
-                stopHttpServer(service);
+                stopUdpService(service);
             } catch (final TimeoutException ignored) { }
             
             int handleToClose = currentTunnelHandle;
@@ -428,6 +581,7 @@ public final class GoBackend implements Backend {
 
     public static class VpnService extends android.net.VpnService {
         @Nullable private GoBackend owner;
+        @Nullable private PowerManager.WakeLock wakeLock;
 
         public Builder getBuilder() {
             return new Builder();
@@ -437,6 +591,7 @@ public final class GoBackend implements Backend {
         public void onCreate() {
             vpnService.complete(this);
             createNotificationChannel();
+            acquireWakeLock();
             super.onCreate();
         }
 
@@ -445,8 +600,8 @@ public final class GoBackend implements Backend {
             if (owner != null) {
                 final Tunnel tunnel = owner.currentTunnel;
                 if (tunnel != null) {
-                    // 停止 HTTP 服务
-                    owner.stopHttpServer(this);
+                    // 停止 UDP 监听服务
+                    owner.stopUdpService(this);
                     
                     if (owner.currentTunnelHandle != -1)
                         wgTurnOff(owner.currentTunnelHandle);
@@ -456,6 +611,8 @@ public final class GoBackend implements Backend {
                     tunnel.onStateChange(State.DOWN);
                 }
             }
+            
+            releaseWakeLock();
             vpnService = vpnService.newIncompleteFuture();
             super.onDestroy();
         }
@@ -468,22 +625,55 @@ public final class GoBackend implements Backend {
                 if (alwaysOnCallback != null)
                     alwaysOnCallback.alwaysOnTriggered();
             }
-            return START_STICKY; // 改为 START_STICKY 以便系统重启服务
+            return START_STICKY;
+        }
+
+        @Override
+        public void onRevoke() {
+            Log.w(TAG, "VPN service revoked by user");
+            if (owner != null) {
+                owner.stopUdpService(this);
+            }
+            super.onRevoke();
         }
 
         public void setOwner(final GoBackend owner) {
             this.owner = owner;
         }
 
-        // 创建通知渠道
+        private void acquireWakeLock() {
+            if (wakeLock == null) {
+                PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (powerManager != null) {
+                    wakeLock = powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "WireGuard:UdpService"
+                    );
+                    wakeLock.acquire();
+                    Log.d(TAG, "WakeLock acquired for UDP service");
+                }
+            }
+        }
+
+        private void releaseWakeLock() {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+                wakeLock = null;
+                Log.d(TAG, "WakeLock released");
+            }
+        }
+
         private void createNotificationChannel() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
-                    HTTP_SERVICE_CHANNEL_ID,
-                    "WireGuard HTTP Service",
+                    UDP_SERVICE_CHANNEL_ID,
+                    "WireGuard UDP Service",
                     NotificationManager.IMPORTANCE_LOW
                 );
-                channel.setDescription("HTTP service for WireGuard tunnel");
+                channel.setDescription("UDP listener service for WireGuard tunnel");
+                channel.setShowBadge(false);
+                channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                
                 NotificationManager notificationManager = getSystemService(NotificationManager.class);
                 if (notificationManager != null) {
                     notificationManager.createNotificationChannel(channel);
@@ -491,28 +681,49 @@ public final class GoBackend implements Backend {
             }
         }
 
-        // 启动前台服务通知
-        void startHttpServiceForeground() {
+        void startUdpServiceForeground() {
             Notification.Builder builder;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder = new Notification.Builder(this, HTTP_SERVICE_CHANNEL_ID);
+                builder = new Notification.Builder(this, UDP_SERVICE_CHANNEL_ID);
             } else {
                 builder = new Notification.Builder(this);
             }
             
             Notification notification = builder
-                .setContentTitle("WireGuard HTTP Service")
-                .setContentText("HTTP service is running on port 1337")
+                .setContentTitle("WireGuard UDP Service")
+                .setContentText("UDP listener on port " + UDP_LISTEN_PORT)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setOngoing(true)
+                .setShowWhen(true)
                 .build();
 
-            startForeground(HTTP_SERVICE_NOTIFICATION_ID, notification);
+            startForeground(UDP_SERVICE_NOTIFICATION_ID, notification);
+            Log.d(TAG, "UDP service foreground started");
         }
 
-        // 停止前台服务通知
-        void stopHttpServiceForeground() {
+        void updateNotification(String statusText) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                return;
+            }
+            
+            Notification.Builder builder = new Notification.Builder(this, UDP_SERVICE_CHANNEL_ID);
+            Notification notification = builder
+                .setContentTitle("WireGuard UDP Service")
+                .setContentText(statusText)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setOngoing(true)
+                .setShowWhen(true)
+                .build();
+
+            NotificationManager notificationManager = getSystemService(NotificationManager.class);
+            if (notificationManager != null) {
+                notificationManager.notify(UDP_SERVICE_NOTIFICATION_ID, notification);
+            }
+        }
+
+        void stopUdpServiceForeground() {
             stopForeground(true);
+            Log.d(TAG, "UDP service foreground stopped");
         }
     }
 }
