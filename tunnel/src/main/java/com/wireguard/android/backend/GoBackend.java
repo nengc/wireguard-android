@@ -58,7 +58,7 @@ public final class GoBackend implements Backend {
      */
     public GoBackend(final Context context) {
         SharedLibraryLoader.loadSharedLibrary(context, "wg-go");
-        // SharedLibraryLoader.loadSharedLibrary(context, "copy_u2t_tlcp_android");
+        SharedLibraryLoader.loadSharedLibrary(context, "u2t_tlcp_android");
         SharedLibraryLoader.loadSharedLibrary(context, "u2t_tlcp_jni");
         this.context = context;
     }
