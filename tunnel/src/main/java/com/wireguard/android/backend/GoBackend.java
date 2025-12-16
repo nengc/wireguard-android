@@ -89,39 +89,69 @@ public final class GoBackend implements Backend {
         }
     }
 
-    // 启动 HTTP 服务
+    // 启动 HTTP 服务（延迟启动，确保 VPN 隧道完全就绪）
     private void startHttpServer(final VpnService service) {
         if (httpServerRunning) {
             Log.d(TAG, "HTTP server already running");
             return;
         }
 
-        if (!isPortAvailable(1337)) {
-            Log.w(TAG, "Port 1337 is not available");
-            return;
-        }
+        // 先启动前台通知，防止服务被杀
+        service.startHttpServiceForeground();
 
-        httpServerRunning = true;
-        httpServerThread = new Thread(() -> {
+        // 延迟启动，给 VPN 隧道一些初始化时间
+        new Thread(() -> {
             try {
+                // 等待 2 秒，确保 VPN 隧道完全建立
+                Thread.sleep(2000);
+                
+                // 检查 VPN 是否还在运行
+                if (currentTunnelHandle == -1) {
+                    Log.w(TAG, "VPN tunnel closed, skipping HTTP server start");
+                    return;
+                }
+
+                // 再次检查端口（可能之前的进程没清理干净）
+                if (!isPortAvailable(1337)) {
+                    Log.w(TAG, "Port 1337 is not available, waiting...");
+                    // 等待最多 10 秒，每秒检查一次
+                    for (int i = 0; i < 10; i++) {
+                        Thread.sleep(1000);
+                        if (isPortAvailable(1337)) {
+                            Log.i(TAG, "Port 1337 became available");
+                            break;
+                        }
+                        if (currentTunnelHandle == -1) {
+                            Log.w(TAG, "VPN closed during port wait");
+                            return;
+                        }
+                    }
+                    
+                    if (!isPortAvailable(1337)) {
+                        Log.e(TAG, "Port 1337 still not available after 10 seconds, aborting");
+                        return;
+                    }
+                }
+
+                httpServerRunning = true;
+                httpServerThread = Thread.currentThread();
+                
                 Log.i(TAG, "Starting HTTP server on port 1337");
-                // 调用 native 方法启动服务器
-                run("192.168.1.244:1337", "0.0.0.0:1337", 
+                // 调用 native 方法启动服务器（这可能是阻塞调用）
+                String result = run("192.168.1.244:1337", "0.0.0.0:1337", 
                     "certs/chain-ca.crt", "info", "10.0.0.0/24");
+                Log.i(TAG, "HTTP server returned: " + result);
+                
+            } catch (InterruptedException e) {
+                Log.i(TAG, "HTTP server thread interrupted");
             } catch (Exception e) {
                 Log.e(TAG, "HTTP server crashed", e);
             } finally {
                 httpServerRunning = false;
+                httpServerThread = null;
                 Log.i(TAG, "HTTP server stopped");
             }
-        }, "WireGuard-HTTP-Server");
-        
-        httpServerThread.setDaemon(false); // 不设为守护线程
-        httpServerThread.setPriority(Thread.NORM_PRIORITY);
-        httpServerThread.start();
-
-        // 启动前台通知
-        service.startHttpServiceForeground();
+        }, "WireGuard-HTTP-Server").start();
     }
 
     // 停止 HTTP 服务
