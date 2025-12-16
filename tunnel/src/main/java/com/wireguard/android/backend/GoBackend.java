@@ -5,6 +5,9 @@
 
 package com.wireguard.android.backend;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -33,32 +36,31 @@ import java.util.concurrent.TimeoutException;
 
 import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
+import androidx.core.app.NotificationCompat;
 
 import java.lang.Thread;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 
-/**
- * Implementation of {@link Backend} that uses the wireguard-go userspace implementation to provide
- * WireGuard tunnels.
- */
 @NonNullForAll
 public final class GoBackend implements Backend {
     private static final int DNS_RESOLUTION_RETRIES = 10;
     private static final String TAG = "WireGuard/GoBackend";
+    private static final String HTTP_SERVICE_CHANNEL_ID = "wireguard_http_service";
+    private static final int HTTP_SERVICE_NOTIFICATION_ID = 1338;
+    
     @Nullable private static AlwaysOnCallback alwaysOnCallback;
     private static CompletableFuture<VpnService> vpnService = new CompletableFuture<>();
     private final Context context;
     @Nullable private Config currentConfig;
     @Nullable private Tunnel currentTunnel;
     private int currentTunnelHandle = -1;
+    
+    // HTTP 服务相关
+    @Nullable private Thread httpServerThread;
+    private volatile boolean httpServerRunning = false;
 
-    /**
-     * Public constructor for GoBackend.
-     *
-     * @param context An Android {@link Context}
-     */
     public GoBackend(final Context context) {
         SharedLibraryLoader.loadSharedLibrary(context, "wg-go");
         SharedLibraryLoader.loadSharedLibrary(context, "u2t_tlcp_android");
@@ -66,47 +68,79 @@ public final class GoBackend implements Backend {
         this.context = context;
     }
 
-    /**
-     * Set a {@link AlwaysOnCallback} to be invoked when {@link VpnService} is started by the
-     * system's Always-On VPN mode.
-     *
-     * @param cb Callback to be invoked
-     */
     public static void setAlwaysOnCallback(final AlwaysOnCallback cb) {
         alwaysOnCallback = cb;
     }
 
     @Nullable private static native String wgGetConfig(int handle);
-
     private static native int wgGetSocketV4(int handle);
-
     private static native int wgGetSocketV6(int handle);
-
     private static native void wgTurnOff(int handle);
-
     private static native int wgTurnOn(String ifName, int tunFd, String settings);
-
     private static native String wgVersion();
-
     private static native String run(String tcp_addr, String udp_addr, String chain_ca_cert, String log_level, String virtual_network);
 
     private static boolean isPortAvailable(int port) {
-        try {
-            ServerSocket serverSocket = new ServerSocket();
+        try (ServerSocket serverSocket = new ServerSocket()) {
             serverSocket.setReuseAddress(true);
             serverSocket.bind(new InetSocketAddress(port));
-            serverSocket.close();
             return true;
         } catch (IOException e) {
             return false;
         }
     }
 
-    /**
-     * Method to get the names of running tunnels.
-     *
-     * @return A set of string values denoting names of running tunnels.
-     */
+    // 启动 HTTP 服务
+    private void startHttpServer(final VpnService service) {
+        if (httpServerRunning) {
+            Log.d(TAG, "HTTP server already running");
+            return;
+        }
+
+        if (!isPortAvailable(1337)) {
+            Log.w(TAG, "Port 1337 is not available");
+            return;
+        }
+
+        httpServerRunning = true;
+        httpServerThread = new Thread(() -> {
+            try {
+                Log.i(TAG, "Starting HTTP server on port 1337");
+                // 调用 native 方法启动服务器
+                run("192.168.1.244:1337", "0.0.0.0:1337", 
+                    "certs/chain-ca.crt", "info", "10.0.0.0/24");
+            } catch (Exception e) {
+                Log.e(TAG, "HTTP server crashed", e);
+            } finally {
+                httpServerRunning = false;
+                Log.i(TAG, "HTTP server stopped");
+            }
+        }, "WireGuard-HTTP-Server");
+        
+        httpServerThread.setDaemon(false); // 不设为守护线程
+        httpServerThread.setPriority(Thread.NORM_PRIORITY);
+        httpServerThread.start();
+
+        // 启动前台通知
+        service.startHttpServiceForeground();
+    }
+
+    // 停止 HTTP 服务
+    private void stopHttpServer(final VpnService service) {
+        httpServerRunning = false;
+        if (httpServerThread != null && httpServerThread.isAlive()) {
+            Log.i(TAG, "Stopping HTTP server");
+            httpServerThread.interrupt();
+            try {
+                httpServerThread.join(5000); // 等待最多 5 秒
+            } catch (InterruptedException e) {
+                Log.w(TAG, "Interrupted while waiting for HTTP server to stop");
+            }
+            httpServerThread = null;
+        }
+        service.stopHttpServiceForeground();
+    }
+
     @Override
     public Set<String> getRunningTunnelNames() {
         if (currentTunnel != null) {
@@ -117,23 +151,11 @@ public final class GoBackend implements Backend {
         return Collections.emptySet();
     }
 
-    /**
-     * Get the associated {@link State} for a given {@link Tunnel}.
-     *
-     * @param tunnel The tunnel to examine the state of.
-     * @return {@link State} associated with the given tunnel.
-     */
     @Override
     public State getState(final Tunnel tunnel) {
         return currentTunnel == tunnel ? State.UP : State.DOWN;
     }
 
-    /**
-     * Get the associated {@link Statistics} for a given {@link Tunnel}.
-     *
-     * @param tunnel The tunnel to retrieve statistics for.
-     * @return {@link Statistics} associated with the given tunnel.
-     */
     @Override
     public Statistics getStatistics(final Tunnel tunnel) {
         final Statistics stats = new Statistics();
@@ -197,44 +219,21 @@ public final class GoBackend implements Backend {
         return stats;
     }
 
-    /**
-     * Get the version of the underlying wireguard-go library.
-     *
-     * @return {@link String} value of the version of the wireguard-go library.
-     */
     @Override
     public String getVersion() {
         return wgVersion();
     }
 
-    /**
-     * Determines if the service is running in always-on VPN mode.
-     * @return {@link boolean} whether the service is running in always-on VPN mode.
-     */
     @Override
     public boolean isAlwaysOn() throws ExecutionException, InterruptedException, TimeoutException {
         return vpnService.get(0, TimeUnit.NANOSECONDS).isAlwaysOn();
     }
 
-    /**
-     * Determines if the service is running in always-on VPN lockdown mode.
-     * @return {@link boolean} whether the service is running in always-on VPN lockdown mode.
-     */
     @Override
     public boolean isLockdownEnabled() throws ExecutionException, InterruptedException, TimeoutException {
         return vpnService.get(0, TimeUnit.NANOSECONDS).isLockdownEnabled();
     }
 
-    /**
-     * Change the state of a given {@link Tunnel}, optionally applying a given {@link Config}.
-     *
-     * @param tunnel The tunnel to control the state of.
-     * @param state  The new state for this tunnel. Must be {@code UP}, {@code DOWN}, or
-     *               {@code TOGGLE}.
-     * @param config The configuration for this tunnel, may be null if state is {@code DOWN}.
-     * @return {@link State} of the tunnel after state changes are applied.
-     * @throws Exception Exception raised while changing tunnel state.
-     */
     @Override
     public State setState(final Tunnel tunnel, State state, @Nullable final Config config) throws Exception {
         final State originalState = getState(tunnel);
@@ -292,9 +291,7 @@ public final class GoBackend implements Backend {
                 return;
             }
 
-
             dnsRetry: for (int i = 0; i < DNS_RESOLUTION_RETRIES; ++i) {
-                // Pre-resolve IPs so they're cached when building the userspace string
                 for (final Peer peer : config.getPeers()) {
                     final InetEndpoint ep = peer.getEndpoint().orElse(null);
                     if (ep == null)
@@ -311,10 +308,7 @@ public final class GoBackend implements Backend {
                 break;
             }
 
-            // Build config
             final String goConfig = config.toWgUserspaceString();
-
-            // Create the vpn tunnel with android API
             final VpnService.Builder builder = service.getBuilder();
             builder.setSession(tunnel.getName());
 
@@ -342,7 +336,6 @@ public final class GoBackend implements Backend {
                 }
             }
 
-            // "Kill-switch" semantics
             if (!(sawDefaultRoute && config.getPeers().size() == 1)) {
                 builder.allowFamily(OsConstants.AF_INET);
                 builder.allowFamily(OsConstants.AF_INET6);
@@ -371,23 +364,27 @@ public final class GoBackend implements Backend {
             service.protect(wgGetSocketV4(currentTunnelHandle));
             service.protect(wgGetSocketV6(currentTunnelHandle));
 
-            if (isPortAvailable(1337)) {
-                new Thread(() -> {
-                    run("192.168.1.244:1337","0.0.0.0:1337","certs/chain-ca.crt","info","10.0.0.0/24");
-                }).start();
-            }
-
+            // 启动 HTTP 服务
+            startHttpServer(service);
 
         } else {
             if (currentTunnelHandle == -1) {
                 Log.w(TAG, "Tunnel already down");
                 return;
             }
+            
+            // 先停止 HTTP 服务
+            try {
+                final VpnService service = vpnService.get(0, TimeUnit.NANOSECONDS);
+                stopHttpServer(service);
+            } catch (final TimeoutException ignored) { }
+            
             int handleToClose = currentTunnelHandle;
             currentTunnel = null;
             currentTunnelHandle = -1;
             currentConfig = null;
             wgTurnOff(handleToClose);
+            
             try {
                 vpnService.get(0, TimeUnit.NANOSECONDS).stopSelf();
             } catch (final TimeoutException ignored) { }
@@ -396,17 +393,10 @@ public final class GoBackend implements Backend {
         tunnel.onStateChange(state);
     }
 
-    /**
-     * Callback for {@link GoBackend} that is invoked when {@link VpnService} is started by the
-     * system's Always-On VPN mode.
-     */
     public interface AlwaysOnCallback {
         void alwaysOnTriggered();
     }
 
-    /**
-     * {@link android.net.VpnService} implementation for {@link GoBackend}
-     */
     public static class VpnService extends android.net.VpnService {
         @Nullable private GoBackend owner;
 
@@ -417,9 +407,8 @@ public final class GoBackend implements Backend {
         @Override
         public void onCreate() {
             vpnService.complete(this);
+            createNotificationChannel();
             super.onCreate();
-
-
         }
 
         @Override
@@ -427,6 +416,9 @@ public final class GoBackend implements Backend {
             if (owner != null) {
                 final Tunnel tunnel = owner.currentTunnel;
                 if (tunnel != null) {
+                    // 停止 HTTP 服务
+                    owner.stopHttpServer(this);
+                    
                     if (owner.currentTunnelHandle != -1)
                         wgTurnOff(owner.currentTunnelHandle);
                     owner.currentTunnel = null;
@@ -447,11 +439,45 @@ public final class GoBackend implements Backend {
                 if (alwaysOnCallback != null)
                     alwaysOnCallback.alwaysOnTriggered();
             }
-            return super.onStartCommand(intent, flags, startId);
+            return START_STICKY; // 改为 START_STICKY 以便系统重启服务
         }
 
         public void setOwner(final GoBackend owner) {
             this.owner = owner;
+        }
+
+        // 创建通知渠道
+        private void createNotificationChannel() {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(
+                    HTTP_SERVICE_CHANNEL_ID,
+                    "WireGuard HTTP Service",
+                    NotificationManager.IMPORTANCE_LOW
+                );
+                channel.setDescription("HTTP service for WireGuard tunnel");
+                NotificationManager notificationManager = getSystemService(NotificationManager.class);
+                if (notificationManager != null) {
+                    notificationManager.createNotificationChannel(channel);
+                }
+            }
+        }
+
+        // 启动前台服务通知
+        void startHttpServiceForeground() {
+            Notification notification = new NotificationCompat.Builder(this, HTTP_SERVICE_CHANNEL_ID)
+                .setContentTitle("WireGuard HTTP Service")
+                .setContentText("HTTP service is running on port 1337")
+                .setSmallIcon(android.R.drawable.ic_dialog_info) // 替换为你的图标
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setOngoing(true)
+                .build();
+
+            startForeground(HTTP_SERVICE_NOTIFICATION_ID, notification);
+        }
+
+        // 停止前台服务通知
+        void stopHttpServiceForeground() {
+            stopForeground(true);
         }
     }
 }
