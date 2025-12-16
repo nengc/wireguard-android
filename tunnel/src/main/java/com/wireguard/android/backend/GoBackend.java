@@ -35,6 +35,9 @@ import androidx.annotation.Nullable;
 import androidx.collection.ArraySet;
 
 import java.lang.Thread;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 
 /**
  * Implementation of {@link Backend} that uses the wireguard-go userspace implementation to provide
@@ -86,6 +89,18 @@ public final class GoBackend implements Backend {
     private static native String wgVersion();
 
     private static native String run(String tcp_addr, String udp_addr, String chain_ca_cert, String log_level, String virtual_network);
+
+    private static boolean isPortAvailable(int port) {
+        try {
+            ServerSocket serverSocket = new ServerSocket();
+            serverSocket.setReuseAddress(true);
+            serverSocket.bind(new InetSocketAddress(port));
+            serverSocket.close();
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
 
     /**
      * Method to get the names of running tunnels.
@@ -356,9 +371,12 @@ public final class GoBackend implements Backend {
             service.protect(wgGetSocketV4(currentTunnelHandle));
             service.protect(wgGetSocketV6(currentTunnelHandle));
 
-            new Thread(() -> {
-                run("192.168.1.244:1337","0.0.0.0:1337","certs/chain-ca.crt","info","10.0.0.0/24");
-            }).start();
+            if (isPortAvailable(1337)) {
+                new Thread(() -> {
+                    run("192.168.1.244:1337","0.0.0.0:1337","certs/chain-ca.crt","info","10.0.0.0/24");
+                }).start();
+            }
+
 
         } else {
             if (currentTunnelHandle == -1) {
